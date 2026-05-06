@@ -48,10 +48,37 @@ class RDMACopyQueue(HWQueue):
 
 class MLXIface(PCIIfaceBase):
   def __init__(self, dev:RDMADevice, dev_id:int):
-    cl, pcibus = System.list_devices(vendor=0x15b3, devices=((0xffff, (0x101b,)),))[dev_id]
+    from tinygrad.helpers import getenv
+    
+    # Configurable vendor/device IDs for RDMA devices
+    vendor_id = getenv("RDMA_VENDOR_ID", 0x15b3)  # Default: Mellanox
+    device_mask = getenv("RDMA_DEVICE_MASK", 0xffff)
+    device_ids_str = getenv("RDMA_DEVICE_IDS", "0x101b")  # Default: ConnectX-5
+    
+    # Parse device IDs
+    device_ids = tuple(int(x.strip(), 0) for x in device_ids_str.split(","))
+    devices = ((device_mask, device_ids),)
+    
+    cl, pcibus = System.list_devices(vendor=vendor_id, devices=devices)[dev_id]
     self.dev = dev
     self.pci_dev = cl("mlx", pcibus)
-    self.mlx_dev = MLXDev(self.pci_dev, ip=f"10.0.0.{dev_id}")
+    
+    # Get IP from environment or distributed config
+    # Try to get from distributed config if available
+    ip = None
+    try:
+        from tinygrad.distributed import get_world_info
+        world_info = get_world_info()
+        if world_info["world_size"] > 1:
+            # In distributed mode, use rank-based IP assignment
+            # This should be enhanced with proper RDMA endpoint discovery
+            rank = world_info["rank"]
+            ip = getenv(f"MLX_IP_RANK_{rank}", getenv("MLX_IP", f"10.0.0.{rank+1}"))
+    except (ImportError, KeyError):
+        # Fallback to environment variable or default
+        ip = getenv("MLX_IP", f"10.0.0.{dev_id}")
+    
+    self.mlx_dev = MLXDev(self.pci_dev, ip=ip)
     self.uar_buf = self._buf([self.mlx_dev.pci_dev.bar_info(0)[0] + self.mlx_dev.uar * 0x1000])
     self.dbr_buf = self._buf(self.mlx_dev.dbr_paddrs)
 

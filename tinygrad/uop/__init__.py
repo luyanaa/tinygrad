@@ -102,6 +102,9 @@ class Ops(FastEnum):
 
   # reduce
   REDUCE_AXIS = auto(); REDUCE = auto(); ALLREDUCE = auto()
+  
+  # distributed primitives
+  ALLTOALL = auto(); SEND = auto(); RECV = auto(); CHECKPOINT = auto()
 
   # expander ops
   UNROLL = auto(); CONTRACT = auto(); VCAT = auto(); PTRCAT = auto()

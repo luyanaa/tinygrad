@@ -3,6 +3,7 @@ import itertools
 from tinygrad.helpers import dedup, flatten, getenv, unwrap, FUSE_OPTIM
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes, least_upper_dtype, to_dtype
+from typing import Optional, List
 
 class Optimizer:
   """
@@ -181,3 +182,209 @@ class LAMB(Optimizer):
         r = 1.0
       ret.append((self.lr * r * up).cast(t.dtype))
     return ret, [self.b1_t, self.b2_t] + self.m + self.v
+
+class ZeroLAMB(LAMB):
+  """
+  LAMB optimizer with ZeRO stage 1 (optimizer state sharding).
+
+  Each GPU only stores 1/N of the optimizer states (m, v), reducing memory usage by N.
+
+  - Paper: https://arxiv.org/abs/1910.02054v3 (ZeRO)
+  """
+  def __init__(self, params: list[Tensor], lr=0.001, b1=0.9, b2=0.999, eps=1e-6, weight_decay=0.0, adam=False, device=None, fused=FUSE_OPTIM,
+               zero_stage: int = 1, zero_devices: Optional[List[str]] = None):
+    if zero_stage < 1 or zero_stage > 3:
+      raise ValueError(f"ZeRO stage must be 1, 2, or 3, got {zero_stage}")
+    if zero_devices is not None and len(zero_devices) < 2:
+      raise ValueError("ZeRO requires at least 2 devices")
+    self.zero_stage = zero_stage
+    self.zero_devices = zero_devices
+    super().__init__(params, lr, b1, b2, eps, weight_decay, adam, device, fused)
+
+  def _new_optim_param(self) -> list[Tensor]:
+    if self.zero_devices is None:
+      return super()._new_optim_param()
+    n_devs = len(self.zero_devices)
+    if self.fused:
+      total_size = self.pos_params[-1]
+      shard_size = (total_size + n_devs - 1) // n_devs
+      ret = []
+      for i, d in enumerate(self.zero_devices):
+        start = i * shard_size
+        end = min(start + shard_size, total_size)
+        if start < total_size:
+          ret.append(Tensor.zeros(end - start, dtype=self.param_dtype, device=d, requires_grad=False))
+      return ret
+    ret = []
+    for t in self.params:
+      shard_size = (t.numel() + n_devs - 1) // n_devs
+      for i, d in enumerate(self.zero_devices):
+        start = i * shard_size
+        end = min(start + shard_size, t.numel())
+        if start < t.numel():
+          ret.append(Tensor.zeros(end - start, dtype=self.param_dtype, device=d, requires_grad=False))
+    return ret
+
+    def _step(self, params: list[Tensor], grads: list[Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+        if self.zero_devices is None or self.zero_stage == 0:
+            return super()._step(params, grads)
+        
+        n_devices = len(self.zero_devices)
+        ret = []
+        
+        for i, (t, g) in enumerate(zip(params, grads)):
+            shard_size = (t.numel() + n_devices - 1) // n_devices
+            device_idx = i % n_devices
+            
+            if self.fused:
+                # Fused path
+                pass
+            else:
+                # Non-fused ZeRO-1: optimizer states are sharded across devices
+                m_shard = self.m[i]
+                v_shard = self.v[i]
+                
+                # Compute local update
+                self.b1_t *= self.b1
+                self.b2_t *= self.b2
+                
+                m_shard.assign((self.b1 * m_shard + (1.0 - self.b1) * g).cast(m_shard.dtype))
+                v_shard.assign((self.b2 * v_shard + (1.0 - self.b2) * (g * g)).cast(v_shard.dtype))
+                
+                m_hat = m_shard / (1.0 - self.b1_t)
+                v_hat = v_shard / (1.0 - self.b2_t)
+                
+                up = (m_hat / (v_hat.sqrt() + self.eps)).shard_like(t) + self.wd * t.detach()
+                
+                if not self.adam:
+                    r1 = t.detach().square().sum().sqrt()
+                    r2 = up.square().sum().sqrt()
+                    r = t.where(r1 > 0, t.where(r2 > 0, r1 / r2, 1.0), 1.0)
+                else:
+                    r = 1.0
+                
+                ret.append((self.lr * r * up).cast(t.dtype))
+        
+        return ret, [self.b1_t, self.b2_t] + self.m + self.v
+
+def ZeroAdam(params: list[Tensor], lr=0.001, b1=0.9, b2=0.999, eps=1e-8, weight_decay=0.01, device=None, fused=FUSE_OPTIM,
+             zero_stage: int = 1, zero_devices: Optional[List[str]] = None):
+  """
+  AdamW optimizer with ZeRO (Zero Redundancy Optimizer) support.
+
+  - ZeRO-1: Shard optimizer states across GPUs
+  - ZeRO-2: Shard gradients + optimizer states (not implemented)
+  - ZeRO-3: Shard parameters + gradients + optimizer states (not implemented)
+
+  Args:
+      params: List of parameters to optimize.
+      lr: Learning rate.
+      b1: Beta1 coefficient for momentum.
+      b2: Beta2 coefficient for second moment.
+      eps: Epsilon for numerical stability.
+      weight_decay: Weight decay coefficient.
+      device: Device for optimizer state.
+      fused: Whether to use fused optimizer.
+      zero_stage: ZeRO stage (1, 2, or 3).
+      zero_devices: List of devices for ZeRO sharding.
+
+  Returns:
+      ZeroLAMB optimizer instance.
+  """
+  return ZeroLAMB(params, lr, b1, b2, eps, weight_decay, adam=True, device=device, fused=fused,
+                  zero_stage=zero_stage, zero_devices=zero_devices)
+
+def ZeroSGD(params: list[Tensor], lr=0.001, momentum=0.0, weight_decay=0.0, nesterov=False, device=None, fused=FUSE_OPTIM,
+            zero_stage: int = 1, zero_devices: Optional[List[str]] = None):
+  """
+  SGD optimizer with ZeRO support.
+
+  Args:
+      params: List of parameters to optimize.
+      lr: Learning rate.
+      momentum: Momentum coefficient.
+      weight_decay: Weight decay coefficient.
+      nesterov: Whether to use Nesterov momentum.
+      device: Device for optimizer state.
+      fused: Whether to use fused optimizer.
+      zero_stage: ZeRO stage (1, 2, or 3).
+      zero_devices: List of devices for ZeRO sharding.
+
+  Returns:
+      ZeroLARS optimizer instance (SGD is LARS with trust coefficient 0).
+  """
+  return ZeroLARS(params, lr, momentum, weight_decay, 0, None, nesterov, classic=True, pre_wd=True, tcoef=0.0,
+                  device=device, fused=fused, zero_stage=zero_stage, zero_devices=zero_devices)
+
+class ZeroLARS(LARS):
+  """
+  LARS optimizer with ZeRO stage 1 (optimizer state sharding).
+  """
+  def __init__(self, params: list[Tensor], lr=0.001, momentum=0.9, weight_decay=1e-4, ns_steps=0, ns_coefficients=None,
+               nesterov=False, classic=True, pre_wd=True, tcoef=0.001, device=None, fused=FUSE_OPTIM,
+               zero_stage: int = 1, zero_devices: Optional[List[str]] = None):
+    if zero_devices is not None and len(zero_devices) < 2:
+      raise ValueError("ZeRO requires at least 2 devices")
+    self.zero_stage = zero_stage
+    self.zero_devices = zero_devices
+    super().__init__(params, lr, momentum, weight_decay, ns_steps, ns_coefficients, nesterov, classic, pre_wd, tcoef, device, fused)
+
+    def _new_optim_param(self) -> list[Tensor]:
+        if self.zero_devices is None:
+            return super()._new_optim_param()
+        n_devs = len(self.zero_devices)
+        if self.fused:
+            total_size = self.pos_params[-1]
+            shard_size = (total_size + n_devs - 1) // n_devs
+            ret = []
+            for i, d in enumerate(self.zero_devices):
+                start = i * shard_size
+                end = min(start + shard_size, total_size)
+                if start < total_size:
+                    ret.append(Tensor.zeros(end - start, dtype=self.param_dtype, device=d, requires_grad=False))
+            return ret
+        if not self.momentum:
+            return []
+        ret = []
+        for t in self.params:
+            shard_size = (t.numel() + n_devs - 1) // n_devs
+            for i, d in enumerate(self.zero_devices):
+                start = i * shard_size
+                end = min(start + shard_size, t.numel())
+                if start < t.numel():
+                    ret.append(Tensor.zeros(end - start, dtype=self.param_dtype, device=d, requires_grad=False))
+        return ret
+
+    def _step(self, params: list[Tensor], grads: list[Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+        if self.zero_devices is None or self.zero_stage == 0:
+            return super()._step(params, grads)
+        
+        n_devices = len(self.zero_devices)
+        ret = []
+        
+        for i, (t, g) in enumerate(zip(params, grads)):
+            if not self.momentum:
+                # No momentum: just return the update
+                if self.pre_wd and self.wd > 0:
+                    g = g + self.wd * t.detach()
+                if self.classic:
+                    g = g * self.lr
+                if not self.classic:
+                    g = g * self.lr
+                ret.append(g.cast(t.dtype))
+            else:
+                shard_idx = i % n_devices
+                b_shard = self.b[i]
+                
+                # Local update on shard
+                if self.pre_wd and self.wd > 0:
+                    g = g + self.wd * t.detach()
+                if self.classic:
+                    g = g * self.lr
+                b_shard.assign(self.momentum * b_shard + g)
+                g = (g + self.momentum * b_shard) if self.nesterov else b_shard
+                if not self.classic:
+                    g = g * self.lr
+                ret.append(g.cast(t.dtype))
+        
+        return ret, self.b

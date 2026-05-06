@@ -160,8 +160,11 @@ multi_pm = PatternMatcher([
   (UPat(Ops.CALL, dtype=dtypes.void, name="root", custom_early_reject=set([Ops.MULTI])), lambda root:
     UOp(root.op, root.dtype, tuple(x.src[0] if x.op is Ops.MULTI else x for x in root.src), root.arg)
     if root.src[0].op is not Ops.TUPLE else None),
-  (UPat((Ops.CAST, Ops.BITCAST, Ops.CONTIGUOUS, Ops.DETACH, Ops.CONTIGUOUS_BACKWARD),
+  (UPat((Ops.CAST, Ops.BITCAST, Ops.CONTIGUOUS, Ops.DETACH, Ops.CONTIGUOUS_BACKWARD, Ops.CHECKPOINT),
         src=(UPat(Ops.MULTI, name="multi"), ), name="root"), passthrough_multi),
+  
+  # ALLTOALL, SEND, RECV primitives passthrough for now
+  (UPat((Ops.ALLTOALL, Ops.SEND, Ops.RECV), src=(UPat(Ops.MULTI, name="multi"), ), name="root"), passthrough_multi),
   # remove MULTI from STORE
   (UPat(Ops.STORE, src=(UPat(Ops.MULTI, name="multi"), ), name="root", allow_any_len=True),
     lambda root,multi: UOp(root.op, root.dtype, (multi.src[0],)+tuple(x.src[0] if x.op is Ops.MULTI else x for x in root.src[1:]), root.arg)),

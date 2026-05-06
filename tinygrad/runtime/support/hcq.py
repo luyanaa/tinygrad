@@ -502,6 +502,12 @@ class HCQCompiled(Compiled, Generic[SignalType]):
       try: Device[f'RDMA:{i}']
       except IndexError: raise RuntimeError(f"No RDMA found for peer group '{self.peer_group}'")
 
+  def tcp_dev(self):
+    for i in itertools.count():
+      if (dev:=next((d for d in HCQCompiled.peer_groups[self.peer_group] if type(d).__name__ == 'TCPDevice'), None)): return dev
+      try: Device[f'TCP:{i}']
+      except IndexError: raise RuntimeError(f"No TCP device found for peer group '{self.peer_group}'")
+
   def finalize(self):
     try: self.synchronize() # Try to finalize device in any case.
     except RuntimeError as e: print(f"{self.device} synchronization failed before finalizing: {e}")
@@ -618,7 +624,16 @@ class HCQAllocator(HCQAllocatorBase, Generic[HCQDeviceType]):
         dest.cast('B')[i:i+lsize] = self.b[0].cpu_view().view(size=lsize, fmt='B')[:]
 
   def _transfer(self, dest:HCQBuffer, src:HCQBuffer, sz:int, src_dev:HCQDeviceType, dest_dev:HCQDeviceType):
-    if src_dev.peer_group != dest_dev.peer_group: return src_dev.rdma_dev().allocator._transfer(dest, src, sz, src_dev, dest_dev)
+    if src_dev.peer_group != dest_dev.peer_group:
+      try:
+        return src_dev.rdma_dev().allocator._transfer(dest, src, sz, src_dev, dest_dev)
+      except RuntimeError:
+        pass
+      try:
+        return src_dev.tcp_dev().allocator._transfer(dest, src, sz, src_dev, dest_dev)
+      except RuntimeError:
+        pass
+      raise RuntimeError(f"No cross-peer-group transfer available between {src_dev.device} and {dest_dev.device}")
 
     cast(HCQAllocator, src_dev.allocator).map(dest)
 

@@ -79,6 +79,7 @@ pm_gradient = PatternMatcher([
   (UPat(Ops.AFTER), lambda ctx: (ctx, ctx)),
   # there's no gradient for bitcast
   (UPat(Ops.BITCAST), lambda: (None,)),
+  (UPat(Ops.CHECKPOINT, name="ret"), lambda ctx, ret: (ctx,)),  # Checkpoint just passes through gradients
 ])
 
 def _deepwalk(root:UOp, targets:set[UOp]) -> tuple[list[UOp], dict[UOp, bool]]:
